@@ -1,0 +1,142 @@
+classdef PUMA560Env < rl.env.MATLABEnvironment
+    %PUMA560ENV: Template for defining custom environment in MATLAB.    
+    
+     properties
+         % Your properties here
+        a
+        d
+        alpha
+        jointLimits
+        Ts
+        State
+        DesiredTrajectory
+        MaxJointVel
+        end
+    methods
+        function this = PUMA560Env()
+            % Define observation and action specs as local variables FIRST
+            ObservationInfo = rlNumericSpec([9 1]);
+            ObservationInfo.Name = 'JointAngles and EE Position';
+            ObservationInfo.Description = '6 joint angles (rad) and 3D EE position (mm)';
+            
+            ActionInfo = rlNumericSpec([6 1], ...
+                'LowerLimit', -0.5*ones(6,1), ...
+                'UpperLimit', 0.5*ones(6,1));
+            ActionInfo.Name = 'JointVelocities';
+            
+            % Call superclass constructor as the VERY FIRST use of 'this'
+            this = this@rl.env.MATLABEnvironment(ObservationInfo, ActionInfo);
+        % Robot DH parameters (mm and radians)
+        this.a = [0; 431.8; 20.3; 0; 0; 0];
+        this.d = [0; 0; 150.05; 431.8; 0; 0];
+        this.alpha = [pi/2; 0; -pi/2; pi/2; -pi/2; 0];
+        
+        % Joint limits (radians)
+        this.jointLimits = deg2rad([-160 160; -225 45; -225 45; -110 170; -100 100; -266 266]);
+        
+        % Control sample time (s)
+        this.Ts = 0.1;
+        
+        % State: [6 joint angles; time]
+        this.State= zeros(7,1);
+        
+        % Desired trajectory function handle (time -> position)
+        this.DesiredTrajectory= @(t) [400 + 100*cos(0.5*t); 0; 400 + 100*sin(0.5*t)];
+        
+        % Max joint velocity (rad/s)
+        this.MaxJointVel = 0.5;
+        end
+        
+            %% Step function: applies action, returns next observation, reward, done
+        function [Observation, Reward, IsDone, LoggedSignals] = step(this, Action)
+            jointAngles = this.State(1:6);
+            t = this.State(7);
+            
+            % Clamp action to joint velocity limits
+            Action = max(min(Action, this.ActionInfo.UpperLimit), this.ActionInfo.LowerLimit);
+            
+            % Update joint angles with velocity * sample time
+            jointAngles = jointAngles + Action * this.Ts;
+            
+            % Enforce joint limits
+            jointAngles = max(min(jointAngles, this.jointLimits(:,2)), this.jointLimits(:,1));
+            
+            % Compute forward kinematics for end-effector position
+            eePos = this.forwardKinematics(jointAngles);
+            
+            % Desired end-effector position at time t
+            desiredPos = this.DesiredTrajectory(t);
+            
+            % Compute Jacobian and manipulability measure
+            J = this.computeJacobian(jointAngles);
+            manipulability = sqrt(det(J*J'));
+            
+            % Reward: negative distance to goal minus penalty for singularity
+            distReward = -norm(eePos - desiredPos);
+            singularityPenalty = -10 * (manipulability < 0.05);
+            Reward = distReward + singularityPenalty;
+            
+            % Update state and time
+            t = t + this.Ts;
+            this.State = [jointAngles; t];
+            
+            % Observation: joint angles + end-effector position
+            Observation = [jointAngles; eePos];
+            
+            % Termination condition: joint limits exceeded or near singularity
+            IsDone = any(abs(jointAngles) > pi) || manipulability < 1e-4;
+            
+            % No logged signals for now
+            LoggedSignals = [];
+        end
+        
+        %% Reset function: resets environment to initial state
+        function InitialObservation = reset(this)
+            this.State = zeros(7,1); % zero joint angles and time=0
+            InitialObservation = [this.State(1:6); this.forwardKinematics(this.State(1:6))];
+        end
+    end
+    
+        
+    properties(Access = protected)
+        IsDone = false;
+    end
+    
+    %% Necessary methods
+    
+    
+    %% Helper methods for FK and Jacobian
+    methods
+        function eePos = forwardKinematics(this, jointAngles)
+            % Compute FK position of end-effector (x,y,z) in mm
+            T = eye(4);
+            for i = 1:6
+                A = this.dhTransform(this.a(i), this.alpha(i), this.d(i), jointAngles(i));
+                T = T * A;
+            end
+            eePos = T(1:3,4);
+        end
+        
+        function J = computeJacobian(this, jointAngles)
+            % Compute geometric Jacobian numerically
+            delta = 1e-6;
+            n = numel(jointAngles);
+            J = zeros(3,n);
+            fk0 = this.forwardKinematics(jointAngles);
+            for i = 1:n
+                dq = zeros(n,1);
+                dq(i) = delta;
+                fk1 = this.forwardKinematics(jointAngles + dq);
+                J(:,i) = (fk1 - fk0) / delta;
+            end
+        end
+        
+        function A = dhTransform(~, a, alpha, d, theta)
+            % Standard DH transformation matrix
+            A = [cos(theta),            -sin(theta)*cos(alpha),  sin(theta)*sin(alpha),  a*cos(theta);
+                 sin(theta),             cos(theta)*cos(alpha), -cos(theta)*sin(alpha),  a*sin(theta);
+                 0,                      sin(alpha),             cos(alpha),             d;
+                 0,                      0,                      0,                      1];
+        end
+    end
+end
